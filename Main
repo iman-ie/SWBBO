@@ -1,0 +1,128 @@
+from wdrbo.optimizers import *
+from Benchmark.Test_Function import *
+import argparse
+import botorch
+import numpy as np
+import random
+import torch
+import pickle as pkl
+import time
+import os
+
+parser = argparse.ArgumentParser()
+
+parser.add_argument('--Optimizer', default='SinkhornWassersteinUCB1', type=str)
+parser.add_argument('--TestProblem', default='Ackley', type=str)
+parser.add_argument('--Minimization', action="store_true")
+parser.add_argument('--init_size', default=10, type=int)
+parser.add_argument('--running_rounds', default=110, type=int)
+parser.add_argument('--repeat', default=10, type=int)
+parser.add_argument('--start_seed', default=100, type=int)
+parser.add_argument('--device', default='cuda', type=str)
+parser.add_argument('--beta', default=1.5, type=float)
+parser.add_argument('--DistShift', default=False, type=bool)
+
+args = parser.parse_args()
+
+if (args.Optimizer == 'MMD' or args.Optimizer == 'DRBOKDE') and args.device != 'cpu':
+    args.device = 'cpu'
+    print(f"GPU of {args.Optimizer} is not supported. Set to cpu.")
+print(args)
+device = torch.device(args.device)
+print(device)
+
+# Create the Result directory if it doesn't exist
+os.makedirs('./Result', exist_ok=True)
+
+test_func = eval(args.TestProblem)(negate=not args.Minimization).to(dtype=torch.float64)
+
+for i in range(args.repeat):
+    start = time.time()
+    seed = args.start_seed + i
+    result_prefix = f'./Result/{args.Optimizer}_{args.TestProblem}_{seed}_{args.running_rounds}_{test_func.dim}_{test_func.mu}_{test_func.sigma}_{args.beta}'
+
+    if os.path.exists(f'{result_prefix}_X.pkl'):
+        print(f"Experiment {args.Optimizer}_{args.TestProblem}_{seed}_{args.running_rounds}_{test_func.dim}_{test_func.mu}_{test_func.sigma}_{args.beta} has been already done.")
+        print("Loading previously saved results...")
+        try:
+            with open(f'{result_prefix}_X.pkl', 'rb') as f:
+                X = pkl.load(f)
+            with open(f'{result_prefix}_Y.pkl', 'rb') as f:
+                Y = pkl.load(f)
+            with open(f'{result_prefix}_contexts.pkl', 'rb') as f:
+                contexts = pkl.load(f)
+            print(f"\n==== Loaded Results for seed {seed} ====")
+            print("X:", X)
+            print("Y:", Y)
+            print("Contexts:", contexts)
+
+            stochastic_Y_path = f'{result_prefix}_stochastic_Y.pkl'
+            if os.path.exists(stochastic_Y_path):
+                with open(stochastic_Y_path, 'rb') as f:
+                    stochastic_Y = pkl.load(f)
+                    print("Stochastic Y:", stochastic_Y)
+
+            regret_path = f'{result_prefix}_cumulative_stochastic_regret.pkl'
+            if os.path.exists(regret_path):
+                with open(regret_path, 'rb') as f:
+                    cumulative_stochastic_regret = pkl.load(f)
+                    print("Cumulative Stochastic Regret:", cumulative_stochastic_regret)
+
+            best_Y_path = f'{result_prefix}_best_Y.pkl'
+            if os.path.exists(best_Y_path):
+                with open(best_Y_path, 'rb') as f:
+                    best_Y = pkl.load(f)
+                    print("Best Y:", best_Y)
+
+            print("================================\n")
+        except Exception as e:
+            print(f"Error loading results: {e}")
+        continue
+
+    botorch.manual_seed(seed)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    opt = eval(args.Optimizer + '_Optimizer')(test_func, running_rounds=args.running_rounds, init_size=args.init_size, device=device, beta=args.beta)
+    X, Y, contexts, cumulative_stochastic_regret, best_Y, stochastic_Y = opt.run_opt()
+
+    print(f"\n==== Results for seed {seed} ====")
+    print("X:", X)
+    print("Y:", Y)
+    print("Contexts:", contexts)
+    if stochastic_Y is not None:
+        print("Stochastic Y:", stochastic_Y)
+    if cumulative_stochastic_regret is not None:
+        print("Cumulative Stochastic Regret:", cumulative_stochastic_regret)
+    if best_Y is not None:
+        print("Best Y:", best_Y)
+    print("================================\n")
+
+    # Save results
+    with open(f'{result_prefix}_X.pkl', 'wb') as f:
+        pkl.dump(X.cpu().detach().numpy(), f)
+    with open(f'{result_prefix}_Y.pkl', 'wb') as f:
+        pkl.dump(Y.cpu().detach()
+                 .numpy(), f)
+    with open(f'{result_prefix}_contexts.pkl', 'wb') as f:
+        pkl.dump(contexts.cpu().detach().numpy(), f)
+    if stochastic_Y is not None:
+        with open(f'{result_prefix}_stochastic_Y.pkl', 'wb') as f:
+            pkl.dump(stochastic_Y.cpu().detach().numpy(), f)
+    if cumulative_stochastic_regret is not None:
+        with open(f'{result_prefix}_cumulative_stochastic_regret.pkl', 'wb') as f:
+            pkl.dump(cumulative_stochastic_regret.cpu().detach().numpy(), f)
+    if best_Y is not None:
+        with open(f'{result_prefix}_best_Y.pkl', 'wb') as f:
+            pkl.dump(best_Y.cpu().detach().numpy(), f)
+
+    time_for_run = time.time() - start
+    print(f"Time for {i}th run: {time_for_run} seconds")
+    with open(f'{result_prefix}_time.pkl', 'wb') as f:
+        pkl.dump(time_for_run, f)
+
+    torch.cuda.empty_cache()
+
+if __name__ == '__main__':
+    seeds = [args.start_seed + i for i in range(args.repeat)]
+    print("All done")
