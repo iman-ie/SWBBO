@@ -1,0 +1,271 @@
+import torch
+from botorch.acquisition.analytic import AnalyticAcquisitionFunction
+import numpy as np
+from torch.quasirandom import SobolEngine
+import cvxpy as cp
+import math
+
+
+
+
+class SinkhornBarycenter_POT_UCB(AnalyticAcquisitionFunction):
+    """Sinkhorn Barycenter UCB using POT library with fixed support."""
+
+    def __init__(
+            self,
+            model,  # the GP used for mean/variance.
+            beta,  # exploration weight in the UCB.
+            kde_samples,  # empirical context samples (tensor N×d_c).
+            contexts_samples_for_L,  # a smaller set used only for Lipschitz estimation from [3].
+            radius,  # robustness radius ε.
+            reg=0.001,  # entropic‐regularisation γ for Sinkhorn.
+            num_sinkhorn_iters=100,  # maximum Sinkhorn iterations.
+            num_distributions=10,  # how many candidate distributions to form
+            distribution_method='random',  # simple random partition.
+            barycenter_support_size=50,  # size of fixed support for barycenter
+            posterior_transform=None,
+            maximize=True,
+            **kwargs,
+    ) -> None:
+        super().__init__(model=model, posterior_transform=posterior_transform, **kwargs)
+
+        self.register_buffer("beta", torch.as_tensor(beta, dtype=torch.float32))
+        self.register_buffer("sample_contexts_for_L", contexts_samples_for_L)
+        self.register_buffer("radius", torch.as_tensor(radius, dtype=torch.float32))
+        self.maximize = maximize
+        self.reg = reg
+        self.num_sinkhorn_iters = num_sinkhorn_iters
+        self.barycenter_support_size = barycenter_support_size
+
+        # Auto-size barycenter samples
+        kde_size = len(kde_samples)
+        self.num_distributions = min(num_distributions, kde_size)
+        self.distribution_method = distribution_method
+
+        self.register_buffer("kde_samples", kde_samples.float())
+
+        # Create barycenter using fixed support Sinkhorn algorithm
+        if kde_size <= 10:  # Very small dataset - just use original samples
+            self.barycenter_samples = kde_samples.float()
+            self._original_distributions = [kde_samples.float()]  # ADD THIS LINE
+
+        else:
+            distributions = self._create_distributions(kde_samples.float())
+            self._original_distributions = distributions  # ADD THIS LINE
+
+            try:
+                self.barycenter_samples = self._compute_sinkhorn_barycenter(distributions)
+            except Exception as e:
+                print(f"Sinkhorn barycenter computation failed: {e}")
+                print("Falling back to using original samples...")
+                self.barycenter_samples = kde_samples.float()
+                self._original_distributions = [kde_samples.float()]  # ADD THIS LINE TOO
+
+        self.register_buffer("context_samples", self.barycenter_samples)
+        self.N_samples = self.barycenter_samples.shape[0]
+
+    def _create_distributions(self, contexts):
+        """Split contexts into distributions with minimum size constraint."""
+        n_contexts = len(contexts)
+        min_samples_per_dist = max(1, n_contexts // (self.num_distributions * 2))
+
+        if self.distribution_method == 'random':
+            perm = torch.randperm(n_contexts)
+            contexts = contexts[perm]
+
+        # Create balanced distributions
+        distributions = []
+        samples_per_dist = n_contexts // self.num_distributions
+
+        for i in range(self.num_distributions):
+            start = i * samples_per_dist
+            if i == self.num_distributions - 1:  # Last distribution gets remainder
+                end = n_contexts
+            else:
+                end = start + samples_per_dist
+
+            if end > start:  # Ensure non-empty
+                distributions.append(contexts[start:end])
+
+        return distributions if len(distributions) >= 2 else [contexts]
+
+    def _compute_sinkhorn_barycenter(self, distributions):
+        """Compute Sinkhorn barycenter using POT library with fixed support and sample from it."""
+        if len(distributions) == 1:
+            # Single distribution - use original samples
+            return distributions[0]
+
+        try:
+            # Convert distributions to numpy for POT
+            np_distributions = [dist.detach().cpu().numpy() for dist in distributions]
+
+            # Create fixed support grid
+            all_points = np.vstack(np_distributions)
+            n_support_points = min(self.barycenter_support_size, len(all_points))
+
+            # Sample points for fixed support
+            support_indices = np.random.choice(len(all_points), size=n_support_points, replace=False)
+            fixed_support = all_points[support_indices]
+
+
+            # Prepare data for ot.bregman.barycenter
+            # A should be a matrix where each column represents weights of one distribution on the fixed support
+            A = []
+
+            for dist in np_distributions:
+                # Compute transport plan from distribution to fixed support
+                a = np.ones(len(dist)) / len(dist)  # uniform weights on source
+                b = np.ones(len(fixed_support)) / len(fixed_support)  # uniform weights on target
+
+                # Cost matrix between distribution points and fixed support
+                M = ot.dist(dist, fixed_support, metric='sqeuclidean')
+
+                # Compute optimal transport plan
+                T = ot.sinkhorn(a, b, M, reg=self.reg, numItermax=self.num_sinkhorn_iters)
+
+                # Sum over source points to get weights on fixed support
+                weights_on_support = T.sum(axis=0)
+                A.append(weights_on_support)
+
+            # Stack into matrix (each column is one distribution's weights on fixed support)
+            A = np.column_stack(A)
+
+            # Normalize each column to sum to 1
+            A = A / A.sum(axis=0, keepdims=True)
+
+            # Cost matrix on the fixed support
+            M_support = ot.dist(fixed_support, fixed_support, metric='sqeuclidean')
+
+            # Compute barycenter weights on the fixed support
+            barycenter_weights = ot.bregman.barycenter(
+                A=A,
+                M=M_support,
+                reg=self.reg,
+                numItermax=self.num_sinkhorn_iters,
+                verbose=False
+            )
+
+            # Now sample from the barycenter (fixed_support with barycenter_weights)
+            n_samples = min(len(self.kde_samples), 50)  # Number of samples to draw
+
+            # Method 1: Direct sampling according to barycenter weights
+            sample_indices = np.random.choice(
+                len(fixed_support),
+                size=n_samples,
+                p=barycenter_weights,
+                replace=True
+            )
+            barycenter_samples = fixed_support[sample_indices]
+
+            # Method 2: Alternative - Add small noise to avoid exact duplicates
+            # This can help with diversity when many samples have the same support point
+            # noise_scale = 0.01 * np.std(all_points, axis=0)
+            # noise = np.random.normal(0, noise_scale, barycenter_samples.shape)
+            # barycenter_samples = barycenter_samples + noise
+
+            return torch.tensor(
+                barycenter_samples,
+                dtype=torch.float32,
+                device=distributions[0].device
+            )
+
+        except Exception as e:
+            print(f"Error in fixed support Sinkhorn barycenter computation: {e}")
+            # Fallback to concatenating all distributions
+            return torch.cat(distributions, dim=0)
+
+    def compute_barycenter_metrics(self, ground_truth_mean=None, ground_truth_cov=None):
+        """Compute barycenter quality metrics - CORRECTED VERSION."""
+
+        from .your_metrics_file import BarycenterQualityMetrics  # This won't work
+
+        # CORRECTED: Compute true ground truth barycenter from individual distributions
+        if ground_truth_mean is None or ground_truth_cov is None:
+            if hasattr(self, '_original_distributions') and self._original_distributions:
+                # Compute analytical barycenter of the individual distributions
+                ground_truth_mean, ground_truth_cov = self._compute_true_barycenter_reference()
+            else:
+                print("Warning: Cannot compute proper ground truth - using kde_samples as fallback")
+                ground_truth_mean, ground_truth_cov = BarycenterQualityMetrics.samples_to_gaussian_params(
+                    self.kde_samples
+                )
+
+        # Compute BW22-UVP
+        bw22_uvp = BarycenterQualityMetrics.compute_bw22_uvp(
+            self.barycenter_samples, ground_truth_mean, ground_truth_cov
+        )
+
+        # Compute L2-UVP if original distributions are available
+        l2_uvp = None
+        if hasattr(self, '_original_distributions') and self._original_distributions:
+            l2_uvp = BarycenterQualityMetrics.compute_l2_uvp_approximate(
+                self.barycenter_samples, self._original_distributions,
+                ground_truth_mean, ground_truth_cov
+            )
+
+        return {'BW22-UVP': bw22_uvp, 'L2-UVP': l2_uvp}
+
+    def _compute_true_barycenter_reference(self):
+        """
+        Compute the TRUE barycenter of individual distributions as reference.
+        This is what your Sinkhorn algorithm should approximate.
+        """
+        if not hasattr(self, '_original_distributions') or not self._original_distributions:
+            raise ValueError("Original distributions not available")
+
+        # For equal-weight barycenter, compute empirical mean and covariance
+        all_dist_samples = torch.cat(self._original_distributions, dim=0)
+
+        true_mean = torch.mean(all_dist_samples, dim=0)
+        true_cov = torch.cov(all_dist_samples.T) + 1e-6 * torch.eye(
+            all_dist_samples.shape[1], device=all_dist_samples.device
+        )
+
+        return true_mean, true_cov
+
+
+
+    def forward(self, X):
+        """Forward pass with improved numerical stability."""
+        X = X.squeeze(dim=1)
+        dim = X.shape[1]
+        batch_size = X.shape[0]
+        contexts_dim = self.kde_samples.shape[1]
+
+        device = X.device
+        sample_contexts_for_L = self.sample_contexts_for_L.to(device)
+        context_samples = self.context_samples.to(device)
+        beta = self.beta.to(device)
+        radius = self.radius.to(device)
+
+        # Compute Lipschitz term
+        L = torch.zeros(batch_size, device=device)
+        if radius is not None and radius > 0:
+            sample_contexts_for_L_dim = sample_contexts_for_L.shape[0]
+
+            with torch.enable_grad():
+                X_tmpL = X.unsqueeze(1).expand(-1, sample_contexts_for_L_dim, -1).requires_grad_(True)
+                ContextsL = sample_contexts_for_L.unsqueeze(0).expand(batch_size, -1, -1)
+                X_ContextsL = torch.cat((X_tmpL, ContextsL), dim=-1)
+
+                posteriorL = self.model.posterior(X_ContextsL)
+                ucbL = posteriorL.mean + beta * posteriorL.variance.sqrt()
+                ucbL = ucbL.squeeze(-1)
+
+            grad = torch.autograd.grad(ucbL, X_ContextsL, torch.ones_like(ucbL), retain_graph=True)[0]
+            L = torch.norm(grad[:, :, dim:], dim=-1).max(dim=1)[0]
+
+        # Compute UCB with barycenter samples
+        X_expanded = X.unsqueeze(1).expand(-1, self.N_samples, -1)
+        contexts_expanded = context_samples.unsqueeze(0).expand(batch_size, -1, -1)
+        X_contexts = torch.cat((X_expanded, contexts_expanded), dim=-1)
+        X_contexts = X_contexts.reshape(-1, dim + contexts_dim)
+
+        posterior = self.model.posterior(X_contexts)
+        ucb = posterior.mean + beta * posterior.variance.sqrt()
+        ucb = ucb.reshape(batch_size, self.N_samples)
+
+        # Use max for better exploration
+        expected_ucb = ucb.max(dim=1)[0]
+
+        return expected_ucb - L * radius
